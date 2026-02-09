@@ -1,0 +1,615 @@
+import pandas as pd
+import json
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+import os
+import re
+from datetime import datetime
+import argparse
+import sys
+import logging
+import glob
+
+# --- GLOBAL VARIABLES ---
+# INPUT_FOLDER = r'C:\Users\Tongai.Choto\OneDrive - Kroll\Workspace\Engagements\BHI\Comparison Utility\Firco'
+INPUT_FOLDER = r'C:\Users\Tongai.Choto\OneDrive - Kroll\Workspace\Engagements\BHI\Comparison Utility\OFACVerifier'
+#INPUT_FOLDER = r'\\hapoalim.com\shares\Compliance\Kroll TM-Sanctions Analytics 2025\ECSWorkspace\TChoto\FircoRecon\072025'
+#INPUT_FOLDER = r'\\hapoalim.com\shares\Compliance\Kroll TM-Sanctions Analytics 2025\ECSWorkspace\TChoto\OFACVerifier'
+OUTPUT_FOLDER = INPUT_FOLDER
+
+#config_file_name = 'configFirco.json' 
+config_file_name = 'configOFACVerifier.json'
+
+#output_excel_name = 'Firco_Recon_YYYYMMDD.xlsx' 
+output_excel_name = 'OFAC_Recon_YYYYMMDD.xlsx'
+
+# --- Setup logging ---
+# Get the directory of the current script
+script_dir = os.path.dirname(__file__)
+filename= os.path.join(script_dir, "log.txt")
+# logging.basicConfig(
+#     filename= os.path.join(script_dir, "log.txt"),
+#     level=logging.INFO,
+#     format='%(asctime)s - %(levelname)s - %(message)s'
+# )
+
+
+# 1. Get the root logger and set its level to NOTSET to ensure all messages are processed
+logging.getLogger().setLevel(logging.NOTSET)
+
+# 2. Create a handler that writes log records to the console (sys.stdout)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO) # Only show INFO messages and above on console
+formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
+console_handler.setFormatter(formatter)
+logging.getLogger().addHandler(console_handler)
+
+# 3. Create a handler that writes log records to a file
+file_handler = logging.FileHandler(filename)
+file_handler.setLevel(logging.DEBUG) # Log all DEBUG messages and above to file
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+logging.getLogger().addHandler(file_handler)
+
+# Get a logger for your application
+log = logging.getLogger("Recon")
+
+
+
+# Function to clean a string by removing spaces, '*', and '/'
+def clean_string(text):
+    if isinstance(text, str): # Ensure the value is a string before applying string methods
+        #return text.lower().replace(' ', '').replace('*', '').replace('/', '')
+        return re.sub(r'[^a-zA-Z0-9\s]','',text.lower().replace(' ', ''))
+    return '' 
+
+def get_file_encoding(filename):
+    encodings_to_try = ['utf-8', 'utf-16']
+    
+    # Read a sample of the file in binary mode to check the first line efficiently
+    try:
+        with open(filename, 'rb') as f:
+            # Read an initial buffer (e.g., 1024 bytes) to cover the first line for most files
+            raw_bytes = f.read(1024) 
+    except FileNotFoundError:
+        log.error(f"Error: The file '{filename}' was not found.")
+        return None
+
+    for encoding in encodings_to_try:
+        try:
+            # Attempt to decode the raw bytes with the current encoding
+            # Use 'strict' error handling to raise a UnicodeDecodeError on failure
+            raw_bytes.decode(encoding) 
+            return encoding
+        except UnicodeDecodeError:
+            continue # Try the next encoding
+
+    # If no encoding works
+    log.error("Error: Could not determine encoding for the file using UTF-8 or UTF-16.")
+    return None
+
+def combine_csvs_with_incremental_dedup(folder_path, pattern, column_headers, delimiter):
+    """
+    Combines CSV files matching a pattern in a folder into a single DataFrame,
+    removing duplicate rows as each new file is loaded. Trims all columns.
+
+    folder_path (str): The path to the folder containing the CSV files.
+    pattern (str): The search pattern for files (e.g., "loan*.csv").
+    column_headers (str): List of column headers
+    delimiter (str): csv delimiter e.g. "," or "~" etc.
+
+    """
+   
+    # Use glob to find all files matching the pattern
+    search_pattern = os.path.join(folder_path, pattern)
+    file_list = glob.glob(search_pattern)
+    
+    if not file_list:
+        log.error(f"No files found matching pattern: {search_pattern}")
+        return pd.DataFrame()
+
+    # Initialize an empty DataFrame to hold all the data
+    combined_df = pd.DataFrame()
+
+    log.info(f"Found {len(file_list)} files. Starting incremental processing...")
+
+    for file_path in file_list:
+        log.info(f"Processing file: {os.path.basename(file_path)}")
+        
+        # Read the current file into a temporary DataFrame
+        #current_df = pd.read_csv(file_path)
+
+        file_encoding = get_file_encoding(file_path)
+        if column_headers != None:
+            current_df = pd.read_csv(file_path, dtype=str, delimiter=delimiter, names=column_headers, encoding=file_encoding)
+        else:
+            current_df = pd.read_csv(file_path, dtype=str, delimiter=delimiter, encoding=file_encoding)
+        
+        # Append the current data to the combined DataFrame
+        combined_df = pd.concat([combined_df, current_df], ignore_index=True)
+        
+        # Remove any duplicate rows from the combined DataFrame
+        # By default, drop_duplicates() considers all columns and keeps the first occurrence
+        # The `inplace=True` argument modifies the DataFrame directly
+        combined_df.drop_duplicates(inplace=True) 
+        
+        log.info(f"  Current total unique rows: {len(combined_df)}")
+
+    log.info("Processing complete.")
+    return combined_df
+
+
+def run_comparison(config_file: str, output_file: str, input_folder: str, output_folder: str):
+    '''
+    Reads a config file, compares multiple source files to a target file,
+    and writes a summary of the comparison to an Excel spreadsheet in the
+    directory specified by input_folder.
+    Input files are expected to be in the directory specified by input_folder.
+    Includes a new comparison tab for multiple specific data field mismatches.
+    '''
+    # Ensure directories exist
+    if not os.path.exists(input_folder):
+        os.makedirs(input_folder)
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Get the directory of the current script
+    script_dir = os.path.dirname(__file__)
+
+    # Construct the full path to the JSON file
+    config_file_path = os.path.join(script_dir, config_file)
+
+    try:
+        with open(config_file_path, 'r') as f:
+            config = json.load(f)
+
+        target_name = config['target_name']
+        target_file_name = config['target_file']
+        full_target_path = os.path.join(input_folder, target_file_name)
+        target_keys = config['target_keys']
+        source_files_config = config['source_files']
+        target_delimiter = config['target_delimiter']
+        target_column_headers = config["target_column_headers"]
+
+        file_encoding = get_file_encoding(full_target_path)
+        if target_column_headers != None:
+            target_df = pd.read_csv(full_target_path, dtype=str, delimiter=target_delimiter, names=target_column_headers, encoding=file_encoding)
+        else:
+            target_df = pd.read_csv(full_target_path, dtype=str, delimiter=target_delimiter, encoding=file_encoding)
+        log.info(f'Dataframe for {target_name} loaded')
+
+        #trim key columns
+        for keycol in target_keys:
+            target_df[keycol] = target_df[keycol].str.strip()
+
+        # Ensure the output directory exists
+        if not os.path.exists(input_folder):
+            os.makedirs(input_folder)
+            log.info(f'Created output directory: {input_folder}')
+            
+        full_output_path = os.path.join(output_folder, output_file)
+
+        workbook = Workbook()
+        summary_sheet = workbook.active
+        summary_sheet.title = 'Summary'
+
+        # Create a separate tab for the specific data field mismatch comparison
+        mismatched_field_sheet = workbook.create_sheet(title='Field Mismatches')
+        mismatched_field_sheet.cell(row=1, column=1, value='Source')
+        mismatched_field_sheet.cell(row=1, column=2, value='Compared Fields (Src-Tgt)')
+        mismatched_field_sheet.cell(row=1, column=3, value='Source Key')
+        mismatched_field_sheet.cell(row=1, column=4, value='Source Value')
+        mismatched_field_sheet.cell(row=1, column=5, value='Target Value')
+        
+        mismatch_row_idx = 2
+
+        current_row = 1
+
+        if target_name == "Continuity":
+            target_df_filtered = target_df.drop('FKCO_V_CONTENT', axis=1)
+        else:
+            target_df_filtered = target_df
+
+        # Create a separate tab for the target
+        sheet_title = target_name
+        details_sheet = workbook.create_sheet(title=sheet_title[:31])
+        for r_idx, row in enumerate(dataframe_to_rows(target_df_filtered, index=False, header=True), 1):
+            if r_idx % 10000 == 0:
+                log.info(f"Wrote {r_idx} rows to Excel for {target_name}")
+            for c_idx, value in enumerate(row, 1):
+                details_sheet.cell(row=r_idx, column=c_idx, value=value)
+
+        combined_df = pd.DataFrame() #for sources that need to be combined for further analysis
+        merged_dataframes_dict = {}
+        
+        for source_config in source_files_config:
+            source_name = source_config['name']
+            source_file_name = source_config['source_file']
+            full_source_path = os.path.join(input_folder, source_file_name)
+            source_keys = source_config['source_keys']
+            instructions = source_config.get('instructions', 'No specific instructions provided for this variance.')
+            field_comparisons = source_config.get('field_comparisons', [])
+            field_comparison_type = source_config['field_comparison_type']
+            source_delimiter = source_config['delimiter']
+            combine_group = source_config['combine_group']
+            source_column_headers = source_config['source_column_headers']
+
+            source_df = combine_csvs_with_incremental_dedup(input_folder, source_file_name,source_column_headers,source_delimiter)
+
+            #trim key columns
+            for keycol in source_keys:
+                source_df[keycol] = source_df[keycol].str.strip()
+
+            # --- Main Key Comparison (Left Outer Join) ---
+            merged_df_keys = pd.merge(
+                source_df,
+                target_df,
+                left_on=source_keys,
+                right_on=target_keys,
+                how='left',
+                indicator='_merge_key_compare',
+                suffixes=('_source', '_target') #(suffixes only apply if there are duplicate columns)
+            )
+            merged_df_keys.attrs['source_keys'] = source_keys
+
+            #move the merge column to front
+            col_to_move = merged_df_keys.pop('_merge_key_compare') # Remove the column and store it
+            merged_df_keys.insert(0, '_merge_key_compare', col_to_move) # Insert it at the front
+
+            # Start Custom for certain files
+            if source_name == 'GFT Pmts':
+                pmt_cancel_message = ['CANPAYQ']
+                pmt_returned_messages = ['CMPRFAQ']
+
+                merged_df_keys.insert(loc=0, column='_derived_pmt_status', value = None) 
+                merged_df_keys['_derived_pmt_status'] = None
+                merged_df_keys.loc[merged_df_keys['Queue Name'].isin(pmt_cancel_message), '_derived_pmt_status'] = 'Cancelled Payment'
+                merged_df_keys.loc[(merged_df_keys['Queue Name'].isin(pmt_returned_messages)) & (merged_df_keys['_derived_pmt_status'].isnull()), '_derived_pmt_status'] = 'Returned Payment'
+                merged_df_keys.loc[(merged_df_keys['_merge_key_compare'].str.lower() == 'both') & (merged_df_keys['_derived_pmt_status'].isnull()), '_derived_pmt_status'] = 'Payment in Fircosoft'
+
+                merged_df_keys.insert(loc=0, column='_in_continuity', value = None) 
+                merged_df_keys['_in_continuity'] = merged_df_keys[target_keys[0]]
+
+            if source_name == 'GFT Msgs':
+                msg_cancel_messages = ['CANSIUQ', 'CANSOUQ']
+                msg_override_pmt_type = ['CMPSOUQ']
+                msg_pmt_type = ['103','103+','199','202','910']
+
+                merged_df_keys.insert(loc=0, column='_derived_pmt_status', value = None) 
+                merged_df_keys['_derived_pmt_status'] = None
+                merged_df_keys.loc[~merged_df_keys['Message Type'].isin(msg_pmt_type), '_derived_pmt_status'] = 'System Msgs, Statements, Advices, Postings'
+                merged_df_keys.loc[(merged_df_keys['Message Type'].isin(msg_pmt_type)) & (merged_df_keys['Queue Name'].isin(msg_override_pmt_type)) & (merged_df_keys['_derived_pmt_status'].isnull()), '_derived_pmt_status'] = 'System Msgs, Statements, Advices, Postings'
+                merged_df_keys.loc[(merged_df_keys['Message Type'].isin(msg_pmt_type)) & (merged_df_keys['Queue Name'].isin(msg_override_pmt_type)) & (merged_df_keys['_derived_pmt_status'].isnull()), '_derived_pmt_status'] = 'System Msgs, Statements, Advices, Postings'
+                merged_df_keys.loc[(merged_df_keys['Queue Name'].str.contains('FUT', case=False, na=False)) & (merged_df_keys['_derived_pmt_status'].isnull()), '_derived_pmt_status'] = 'Future'
+                merged_df_keys.loc[(merged_df_keys['Queue Name'].isin(msg_cancel_messages)) & (merged_df_keys['_derived_pmt_status'].isnull()), '_derived_pmt_status'] = 'Cancel Message'
+
+                merged_df_keys.insert(loc=0, column='_in_continuity', value = None) 
+                merged_df_keys['_in_continuity'] = merged_df_keys[target_keys[0]]
+
+                #Need to add it is a payment i.e. match to payment file, this is then used to populate _derived_pmt_status with Screened as Message and Screened as Payment if there is a match to Firco and the payment file.
+                #change order to make sure payment file is read first and stored into global df.
+
+            # --- Combined Data Set ---
+            
+            if combine_group != None and combined_df.empty:
+                combined_df = merged_df_keys
+                combined_df.attrs['last_source_keys'] = source_keys
+                combined_df.attrs['name'] = source_name
+            elif combine_group != None and not combined_df.empty:
+                last_source_keys = combined_df.attrs['last_source_keys']
+
+                combined_df = pd.merge(
+                    merged_df_keys,
+                    combined_df,
+                    left_on=source_keys,
+                    right_on=last_source_keys, #need to track key
+                    how='outer', #full outer join
+                    indicator='_combined_merge_key_compare'
+                    #,
+                    #suffixes=('_source', '_target') #(suffixes only apply if there are duplicate columns)
+                )
+
+                #Create Combined Derived Columns for Pivot
+                # combined_df.insert(loc=0, column='_combined_txn_nbr', value = None) 
+                # combined_df.insert(loc=1, column='_combined_derived_pmt_status', value = None) 
+                # combined_df.insert(loc=2, column='_combined_pmt_or_msg_status', value = None) 
+                # combined_df.insert(loc=3, column='_recon_id', value = None) 
+                # combined_df.insert(loc=4, column='_recon_screening_status', value = None) 
+                # combined_df.insert(loc=5, column='_recon_current_state', value = None) 
+
+                combined_df['_combined_txn_nbr'] = combined_df[source_keys[0]].fillna(combined_df[last_source_keys[0]])
+                combined_df['_combined_derived_pmt_status'] = combined_df['_derived_pmt_status_x'].fillna(combined_df['_derived_pmt_status_y'])
+                combined_df['_combined_pmt_or_msg_status'] = None
+                combined_df.loc[combined_df['_combined_merge_key_compare'].str.lower() == 'both', '_combined_pmt_or_msg_status'] = 'Payment and Msg'
+                combined_df.loc[combined_df['_combined_merge_key_compare'].str.lower() == 'right_only', '_combined_pmt_or_msg_status'] = 'Payment'
+                combined_df.loc[combined_df['_combined_merge_key_compare'].str.lower() == 'left_only', '_combined_pmt_or_msg_status'] = 'Msg'
+
+                combined_df['_recon_id'] = combined_df['MESSAGE_ID_x'].fillna(combined_df['MESSAGE_ID_y'])
+
+                combined_df['_recon_screening_status'] = None
+                combined_df.loc[~combined_df['_recon_id'].isnull(), '_recon_screening_status'] = 'Screened'
+                combined_df.loc[combined_df['_combined_derived_pmt_status'] == 'System Msgs, Statements, Advices, Postings', '_recon_screening_status'] = 'Screening Not Required'
+                combined_df.loc[combined_df['_combined_derived_pmt_status'] == 'Cancel Message', '_recon_screening_status'] = 'Screening Not Required'
+                combined_df.loc[combined_df['_combined_derived_pmt_status'] == 'Future', '_recon_screening_status'] = 'Screening Not Required'
+                combined_df.loc[combined_df['_combined_derived_pmt_status'] == 'Returned Payment', '_recon_screening_status'] = 'Screening Not Required'
+                combined_df.loc[combined_df['_recon_screening_status'].isnull(), '_recon_screening_status'] = 'Screening Required'
+                
+                combined_df['_recon_current_state'] = None
+                combined_df.loc[~combined_df['_recon_id'].isnull() & combined_df['_combined_pmt_or_msg_status'].isin(['Payment', 'Payment and Msg']), '_recon_current_state'] = 'Screened as Payment'
+                combined_df.loc[~combined_df['_recon_id'].isnull() & combined_df['_combined_pmt_or_msg_status'].isin(['Msg']), '_recon_current_state'] = 'Screened as Message'
+                combined_df.loc[combined_df['_recon_current_state'].isnull(), '_recon_current_state'] = combined_df.loc[combined_df['_recon_current_state'].isnull(), '_combined_derived_pmt_status']
+                combined_df.loc[combined_df['_recon_current_state'].isnull(), '_recon_current_state'] = '*Not Received For Screening*'
+
+                combined_df['_alert_last_disposition'] = combined_df['Current State_x'].fillna(combined_df['Current State_y'])
+                combined_df['_alert_status'] = combined_df['Status_x'].fillna(combined_df['Status_y'])
+
+            # End Custom for certain files
+
+            merged_dataframes_dict[source_name] = merged_df_keys
+            matched_records = merged_df_keys[merged_df_keys['_merge_key_compare'] == 'both'].shape[0] # Fix index error
+            source_records = len(source_df)
+            variance = source_records - matched_records
+
+            # Write summary results
+            summary_sheet.cell(row=current_row, column=1, value=f'Comparison: {source_name} to {target_name}')
+            summary_sheet.cell(row=current_row + 1, column=1, value=f'Total No. of Records ({source_name})')
+            summary_sheet.cell(row=current_row + 1, column=2, value=source_records)
+            summary_sheet.cell(row=current_row + 2, column=1, value=f'No. of Records that matched on Keys ({target_name})')
+            summary_sheet.cell(row=current_row + 2, column=2, value=matched_records)
+            summary_sheet.cell(row=current_row + 3, column=1, value='Variance (Unmatched Records on Keys)')
+            summary_sheet.cell(row=current_row + 3, column=2, value=variance)
+
+            if variance > 0:
+                summary_sheet.cell(row=current_row + 4, column=1, value='ACTION REQUIRED:')
+                summary_sheet.cell(row=current_row + 4, column=2, value=instructions)
+
+            current_row += 6 #spacer for next field comparison
+
+             # --- Specific Field Comparisons (Mismatches) ---
+            if field_comparisons:
+                matched_key_records = merged_df_keys[merged_df_keys['_merge_key_compare'] == 'both'].copy() #exact match records on keys
+
+                #cycle through each comparison per source e.g. cname1, then cname2
+                for comparison in field_comparisons:
+                    source_field = comparison['source_field']
+                    target_field = comparison['target_field']
+                    
+                    log.info(f"Now comparing {source_field} to {target_field}")
+                    #(suffixes only apply if there are duplicate columns)
+                    
+                    if source_field in matched_key_records.columns:
+                        source_col_merged_name = source_field
+                    else:
+                        source_col_merged_name = f'{source_field}_source'
+
+                    if target_field in matched_key_records.columns:
+                        target_col_merged_name = target_field
+                    else:
+                        target_col_merged_name = f'{target_field}_target'
+
+                    if field_comparison_type is not None and field_comparison_type == 'contains_remove_special':
+                        mismatched_fields = matched_key_records[matched_key_records.apply(lambda row: clean_string(row[source_col_merged_name]) not in clean_string(row[target_col_merged_name]), axis=1)]
+                    else:
+                        mismatched_fields = matched_key_records[
+                            matched_key_records[source_col_merged_name].astype(str).str.strip().str.lower() != 
+                            matched_key_records[target_col_merged_name].astype(str).str.strip().str.lower()
+                        ]
+
+                    if not mismatched_fields.empty:
+                        field_names_label = f'{source_field}-{target_field}'
+                        for index, row in mismatched_fields.iterrows():
+                            mismatched_field_sheet.cell(row=mismatch_row_idx, column=1, value=source_name)
+                            mismatched_field_sheet.cell(row=mismatch_row_idx, column=2, value=field_names_label)
+                            mismatched_field_sheet.cell(row=mismatch_row_idx, column=3, value=row[source_keys[0]])
+                            mismatched_field_sheet.cell(row=mismatch_row_idx, column=4, value=row[source_col_merged_name])
+                            mismatched_field_sheet.cell(row=mismatch_row_idx, column=5, value=row[target_col_merged_name])
+                            mismatch_row_idx += 1
+                        #mismatch_row_idx += 1
+    
+                #remove FKCO_V_CONTENT column for excel writing to limit excess size
+            if target_name == "Continuity":
+                merged_df_keys = merged_df_keys.drop('FKCO_V_CONTENT', axis=1).copy()
+
+            #TODO: create two tabs per source, one for key reconciled the other for non-reconciled, and change merge_key_compare laebels to 'Reconciled' and 'Not Reconciled'
+            reconciled_df = merged_df_keys[merged_df_keys['_merge_key_compare'] == 'both'].copy()
+            reconciled_df.Name = "_Recon"
+            notreconiled_df = merged_df_keys[merged_df_keys['_merge_key_compare'] != 'both'].copy()
+            notreconiled_df.Name = "_NotRecon"
+            
+            if(reconciled_df.empty == False):
+                #Friendly labels for merge key
+                #pd.Series(reconciled_df['_merge_key_compare'], dtype="category").cat.add_categories(['reconciled', 'not reconciled'])
+                reconciled_df['_merge_key_compare'] = reconciled_df['_merge_key_compare'].cat.add_categories(['reconciled', 'not reconciled'])
+                reconciled_df.loc[reconciled_df['_merge_key_compare'] == 'both', '_merge_key_compare'] = 'reconciled'    
+                reconciled_df.loc[reconciled_df['_merge_key_compare'] == 'left_only', '_merge_key_compare'] = 'not reconciled'   
+                reconciled_df.loc[reconciled_df['_merge_key_compare'] == 'right_only', '_merge_key_compare'] = 'not reconciled'   
+
+                # Create a separate tab for each comparison with detailed results of the KEY comparison
+                sheet_title = source_name + reconciled_df.Name #os.path.splitext(source_file_name)[0] + '_key_details' # Fix sheet title generation
+                details_sheet = workbook.create_sheet(title=sheet_title[:31]) #Truncate to 31 chars for Excel sheet name limit
+                for r_idx, row in enumerate(dataframe_to_rows(reconciled_df, index=False, header=True), 1):
+                    if r_idx % 10000 == 0:
+                        log.info(f"Wrote {r_idx} rows to Excel for {source_name}")
+                    for c_idx, value in enumerate(row, 1):
+                        details_sheet.cell(row=r_idx, column=c_idx, value=value)
+
+            if(notreconiled_df.empty == False):
+                #Friendly labels for merge key
+                # pd.Series(notreconiled_df['_merge_key_compare'], dtype="category").cat.add_categories(['reconciled', 'not reconciled'])
+                notreconiled_df['_merge_key_compare'] = notreconiled_df['_merge_key_compare'].cat.add_categories(['reconciled', 'not reconciled'])
+                notreconiled_df.loc[notreconiled_df['_merge_key_compare'] == 'both', '_merge_key_compare'] = 'reconciled'    
+                notreconiled_df.loc[notreconiled_df['_merge_key_compare'] == 'left_only', '_merge_key_compare'] = 'not reconciled'   
+                notreconiled_df.loc[notreconiled_df['_merge_key_compare'] == 'right_only', '_merge_key_compare'] = 'not reconciled'   
+
+                # Create a separate tab for each comparison with detailed results of the KEY comparison
+                sheet_title = source_name + notreconiled_df.Name #os.path.splitext(source_file_name)[0] + '_key_details' # Fix sheet title generation
+                details_sheet = workbook.create_sheet(title=sheet_title[:31]) #Truncate to 31 chars for Excel sheet name limit
+                for r_idx, row in enumerate(dataframe_to_rows(notreconiled_df, index=False, header=True), 1):
+                    if r_idx % 10000 == 0:
+                        log.info(f"Wrote {r_idx} rows to Excel for {source_name}")
+                    for c_idx, value in enumerate(row, 1):
+                        details_sheet.cell(row=r_idx, column=c_idx, value=value)
+
+        if not combined_df.empty:
+            #remove all columns that do not start with an underscore 
+            # Identify columns to keep (those starting with an underscore)
+            columns_to_keep = [col for col in combined_df.columns if col.startswith('_')]
+
+            # Create a new DataFrame with only the desired columns
+            combined_df_filtered = combined_df[columns_to_keep].copy()
+
+            sheet_title = 'Combined'
+            details_sheet = workbook.create_sheet(title=sheet_title[:31])
+            for r_idx, row in enumerate(dataframe_to_rows(combined_df_filtered, index=False, header=True), 1):
+                for c_idx, value in enumerate(row, 1):
+                    details_sheet.cell(row=r_idx, column=c_idx, value=value)
+
+            # Create the pivot table
+            combined_df_filtered['_recon_screening_status'] = combined_df_filtered['_recon_screening_status'].fillna('Uncategorized')
+            combined_df_filtered['_recon_current_state'] = combined_df_filtered['_recon_current_state'].fillna('Uncategorized')
+            pivot_table = pd.pivot_table(
+                combined_df_filtered,
+                index=["_recon_screening_status", "_recon_current_state"],
+                columns="_combined_pmt_or_msg_status",
+                values="_combined_txn_nbr",
+                aggfunc="count",
+                fill_value=0,
+                margins=True,  # Adds 'All' row and column totals
+                margins_name="Grand Total" # Optional: Customize the name of the total row/column
+            )
+
+            grand_total = pivot_table.loc["Grand Total", "Grand Total"]
+            grand_total = float(grand_total.iloc[0]) #solve for grant total being a series
+            pivot_table["% of Grand Total"] = (pivot_table["Grand Total"] / grand_total * 100.0).round(2)
+
+            # Format the new column as a string with a '%' sign for display
+            pivot_table["% of Grand Total"] = pivot_table["% of Grand Total"].astype(str) + '%'
+
+            # Use ExcelWriter as a context manager and assign the loaded workbook
+            sheet_name = "Recon Summary"
+            # Create a new sheet or get existing sheet
+            if sheet_name in workbook.sheetnames:
+                ws = workbook[sheet_name]
+                # Clear existing data from the sheet if necessary
+                ws.delete_rows(1, ws.max_row) 
+            else:
+                ws = workbook.create_sheet(sheet_name)
+
+            # Convert the pivot table DataFrame to rows and append to the worksheet
+            # index=True and header=True are set by default in dataframe_to_rows, 
+            # which is ideal for the pivot table structure
+            for r in dataframe_to_rows(pivot_table, index=True, header=True):
+                ws.append(r)
+
+            # Optional: Adjust column widths (basic example)
+            for col in ws.columns:
+                max_length = 0
+                column = col[0].column_letter # Get the column name
+                for cell in col:
+                    try: # Necessary to avoid error on empty cells
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2) * 1.2
+                ws.column_dimensions[column].width = adjusted_width
+
+
+            # Create the pivot table
+            combined_df_filtered_alerts = combined_df_filtered.dropna(subset=['_alert_status']) #drop records without alert status
+            combined_df_filtered_alerts['_alert_status'] = combined_df_filtered_alerts['_alert_status'].fillna('Uncategorized')
+            combined_df_filtered_alerts['_alert_last_disposition'] = combined_df_filtered_alerts['_alert_last_disposition'].fillna('No Hits')
+            pivot_table = pd.pivot_table(
+                combined_df_filtered_alerts,
+                index=["_alert_status", "_alert_last_disposition"],
+                columns="_combined_pmt_or_msg_status",
+                values="_combined_txn_nbr",
+                aggfunc="count",
+                fill_value=0,
+                margins=True,  # Adds 'All' row and column totals
+                margins_name="Grand Total" # Optional: Customize the name of the total row/column
+            )
+
+            grand_total = pivot_table.loc["Grand Total", "Grand Total"]
+            grand_total = float(grand_total.iloc[0]) #solve for grant total being a series
+            pivot_table["% of Grand Total"] = (pivot_table["Grand Total"] / grand_total * 100.0).round(2)
+
+            # Format the new column as a string with a '%' sign for display
+            pivot_table["% of Grand Total"] = pivot_table["% of Grand Total"].astype(str) + '%'
+
+            # Use ExcelWriter as a context manager and assign the loaded workbook
+            sheet_name = "Recon Alert Summary"
+            # Create a new sheet or get existing sheet
+            if sheet_name in workbook.sheetnames:
+                ws = workbook[sheet_name]
+                # Clear existing data from the sheet if necessary
+                ws.delete_rows(1, ws.max_row) 
+            else:
+                ws = workbook.create_sheet(sheet_name)
+
+            # Convert the pivot table DataFrame to rows and append to the worksheet
+            # index=True and header=True are set by default in dataframe_to_rows, 
+            # which is ideal for the pivot table structure
+            for r in dataframe_to_rows(pivot_table, index=True, header=True):
+                ws.append(r)
+
+            # Optional: Adjust column widths (basic example)
+            for col in ws.columns:
+                max_length = 0
+                column = col[0].column_letter # Get the column name
+                for cell in col:
+                    try: # Necessary to avoid error on empty cells
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2) * 1.2
+                ws.column_dimensions[column].width = adjusted_width
+
+        # Save the final Excel workbook to the output path
+        workbook.save(full_output_path)
+        log.info(f'Comparison report saved to {full_output_path}')
+
+    except FileNotFoundError as e:
+        error_msg = f'Error: A required file was not found. Ensure directories and files exist. Details: {e}'
+        log.error(error_msg)
+    except KeyError as e:
+        error_msg = f'Error: Missing key in the JSON config file. Please check the structure. Details: {e}'
+        log.error(error_msg)
+    except pd.errors.EmptyDataError:
+        error_msg = f'Error: One of the CSV files is empty.'
+        log.error(error_msg)
+    except Exception as e:
+        error_msg = f'An unexpected error occurred: {e}'
+        log.error(error_msg)
+
+
+if __name__ == '__main__':
+    start_datetime = datetime.now()
+    log.info(f"--- Recon process started {start_datetime}---")
+
+    if len(sys.argv) <= 1:
+        # If debugging, use hardcoded or default arguments for convenience
+        log.info("No arguments detected. Using default arguments.")
+        args = argparse.Namespace(config=config_file_name, output=output_excel_name, indir=INPUT_FOLDER, outdir=OUTPUT_FOLDER)
+    else:
+        parser = argparse.ArgumentParser(description="Utility used to recon multiple source files to a target file.")
+
+        # Add a required named argument for the user's name
+        parser.add_argument("--config", required=True, help="Config file name e.g. configFirco.json or configOFACVerfier.json")
+        parser.add_argument("--output", required=True, help="Output xlsx name e.g. Firco_Recon_YYYYMMDD.xlsx or OFAC_Recon_YYYYMMDD.xlsx")
+        parser.add_argument("--indir", required=True, help="Input Folder Path")
+        parser.add_argument("--outdir", required=True, help="Output Folder Path")
+        #parser.add_argument("--greeting", default="Hello", help="The greeting message.")
+        args = parser.parse_args()
+
+    run_comparison(args.config, args.output, args.indir, args.outdir)
+
+    end_datetime = datetime.now()
+
+    log.info(f"Start time: {start_datetime}")
+    log.info(f"End time: {end_datetime}")
+    log.info(f"Elapsed time: {end_datetime - start_datetime}")
+    log.info(f"--- Recon process completed: {end_datetime} ---")
+	
+	MSGINFO
